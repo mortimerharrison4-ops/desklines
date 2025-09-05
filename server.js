@@ -1,6 +1,6 @@
 import express from "express";
-import * as chrono from "chrono-node";
 import moment from "moment-timezone";
+import * as chrono from "chrono-node";
 
 const app = express();
 app.use(express.json());
@@ -11,7 +11,7 @@ const TZ = moment.tz.zone(process.env.BUSINESS_TZ || DEFAULT_TZ)
   ? (process.env.BUSINESS_TZ || DEFAULT_TZ)
   : DEFAULT_TZ;
 
-// ---- Helpers ----
+// label morning/afternoon/evening/night
 function timeOfDay(h) {
   if (h >= 5 && h < 12) return "morning";
   if (h >= 12 && h < 17) return "afternoon";
@@ -19,60 +19,57 @@ function timeOfDay(h) {
   return "night";
 }
 
-// Parse a spoken time (e.g., "11 am") **as local BUSINESS TZ**
-function normalizeLocalTime(rawTime, dateStr, fallbackMoment) {
-  try {
-    if (!rawTime) return fallbackMoment.format("HH:mm");
+// Parse a local time string in TZ using only moment (no chrono here)
+function parseLocalTimeToHHmm(raw, fallbackMoment) {
+  if (!raw) return fallbackMoment.format("HH:mm");
 
-    // Already HH:mm?
-    if (/^\d{2}:\d{2}$/.test(rawTime)) return rawTime;
+  // already HH:mm?
+  if (/^\d{2}:\d{2}$/.test(raw)) return raw;
 
-    // Parse common am/pm patterns in BUSINESS TZ
-    const ampm = moment.tz(rawTime.trim(), ["h a", "h:mm a", "h.mm a"], TZ, true);
-    if (ampm.isValid()) return ampm.format("HH:mm");
+  // Try a bunch of common formats in strict mode in our TZ
+  const formats = [
+    "h a", "h:mm a", "h.mm a",
+    "ha", "h:mma",
+    "H", "H:mm", "H.mm"
+  ];
+  const m = moment.tz(raw.trim(), formats, TZ, true);
+  if (m.isValid()) return m.format("HH:mm");
 
-    // Fallback: use chrono to extract hour/min
-    const parsed = chrono.parse(rawTime);
-    const comp = parsed?.[0]?.start;
-    if (comp) {
-      const known = comp.knownValues?.() ?? {};
-      const implied = comp.impliedValues?.() ?? {};
-      const hour = (known.hour ?? implied.hour ?? 9);
-      const minute = (known.minute ?? implied.minute ?? 0);
-
-      const m = moment.tz(`${dateStr} 00:00`, "YYYY-MM-DD HH:mm", TZ)
-        .hour(hour).minute(minute).second(0).millisecond(0);
-      return m.format("HH:mm");
-    }
-    return fallbackMoment.format("HH:mm");
-  } catch {
-    return fallbackMoment.format("HH:mm");
-  }
+  // last resort: just use fallback
+  return fallbackMoment.format("HH:mm");
 }
 
 app.get("/", (_req, res) => res.send("ok"));
 
 app.post("/tools/check-availability", (req, res) => {
+  const body = req.body || {};
   try {
-    const body = req.body || {};
-    console.log("Got body:", body);
+    // When the tool was invoked
+    const rawCallTs =
+      body.callTimestamp ||
+      req.header("X-Telnyx-Timestamp") ||
+      new Date().toISOString();
 
-    // Call timestamp (when tool invoked)
-    const rawCallTs = body.callTimestamp || req.header("X-Telnyx-Timestamp") || new Date().toISOString();
     let callMoment = moment(rawCallTs);
     if (!callMoment.isValid()) callMoment = moment();
     callMoment = callMoment.tz(TZ);
 
-    // Inputs (accept aliases)
-    const rawDate = body.date || body.Date || body["appointment_date"] || body["date_requested"];
-    const rawTime = body.time || body.Time || body["appointment_time"] || body["time_requested"];
-    const rawDuration = body.durationMinutes || body.duration || body["duration_minutes"] || body["appointment_duration"];
+    // Accept a few aliases (be forgiving)
+    const rawDate =
+      body.date || body.Date || body["appointment_date"] || body["date_requested"];
+    const rawTime =
+      body.time || body.Time || body["appointment_time"] || body["time_requested"];
+    const rawDuration =
+      body.durationMinutes || body.duration || body["duration_minutes"] || body["appointment_duration"];
 
-    const customerName = body.customerName || body["customer_name"] || body["customer name"];
-    const customerEmail = body.customerEmail || body["customer_email"] || body["customer email"];
-    const customerPhone = body.customerPhone || body["customer_phone"] || body["customer phone"];
+    const customerName =
+      body.customerName || body["customer_name"] || body["customer name"];
+    const customerEmail =
+      body.customerEmail || body["customer_email"] || body["customer email"];
+    const customerPhone =
+      body.customerPhone || body["customer_phone"] || body["customer phone"];
 
-    // Date → YYYY-MM-DD (assume caller speaks in TZ)
+    // ---- Date -> YYYY-MM-DD (assume caller speaks in TZ) ----
     let dateStr;
     if (rawDate) {
       if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
@@ -87,10 +84,10 @@ app.post("/tools/check-availability", (req, res) => {
       dateStr = callMoment.format("YYYY-MM-DD");
     }
 
-    // Time → HH:mm (interpret as local TZ)
-    const timeStr = normalizeLocalTime(rawTime, dateStr, callMoment);
+    // ---- Time -> HH:mm (interpret as local TZ) ----
+    const timeStr = parseLocalTimeToHHmm(rawTime, callMoment);
 
-    // Duration → minutes (default 30)
+    // ---- Duration -> minutes (default 30) ----
     let duration = 30;
     if (rawDuration != null) {
       if (typeof rawDuration === "number") duration = rawDuration;
@@ -100,16 +97,17 @@ app.post("/tools/check-availability", (req, res) => {
       }
     }
 
-    // Compose appointment in TZ
+    // Compose appointment moment in TZ
     const apptMoment = moment.tz(`${dateStr} ${timeStr}`, "YYYY-MM-DD HH:mm", TZ);
 
+    // Friendly message (calendar check comes later)
     const msg =
       `Echo: ${customerName || "Unknown"} wants ${duration} mins ` +
       `on ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} (${timeOfDay(apptMoment.hour())}). ` +
       `Phone: ${customerPhone || "??"}`;
 
     return res.json({
-      isFree: true,         // placeholder until calendar check is added
+      isFree: true,    // placeholder until Google/Outlook check is wired
       eventId: null,
       message: msg,
       call: {
@@ -132,6 +130,7 @@ app.post("/tools/check-availability", (req, res) => {
     });
   } catch (err) {
     console.error("Handler error:", err);
+    // Return JSON (not HTML) so Telnyx tool UI shows a clear error
     return res.status(200).json({
       isFree: false,
       eventId: null,
@@ -141,4 +140,6 @@ app.post("/tools/check-availability", (req, res) => {
   }
 });
 
-app.listen(3000, () => console.log(`Server running on port 3000, TZ=${TZ}`));
+app.listen(3000, () => {
+  console.log(`Server running on port 3000, TZ=${TZ}`);
+});
