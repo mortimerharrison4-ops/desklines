@@ -1,6 +1,6 @@
 import express from "express";
 import moment from "moment";        // npm install moment
-import chrono from "chrono-node";   // npm install chrono-node
+import * as chrono from "chrono-node";   // npm install chrono-node
 
 const app = express();
 app.use(express.json());
