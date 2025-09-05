@@ -2,24 +2,22 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-const SECRET = process.env.TOOL_SECRET || "change-me";
+// Health check (GET /)
+app.get("/", (req, res) => {
+  res.send("ok");
+});
 
-// health check
-app.get("/", (_req, res) => res.send("ok"));
-
-// your webhook tool endpoint
+// Tool endpoint (POST /tools/check-availability)
 app.post("/tools/check-availability", (req, res) => {
-  if (req.header("X-Auth-Token") !== SECRET) {
-    return res.status(401).json({ error: "bad token" });
-  }
-  const { date, time, durationMinutes } = req.body || {};
-  // For now, just echo back so we know it works. Replace with calendar later.
+  const { date, time, durationMinutes, customerName, customerPhone } = req.body;
+  console.log("Got body:", req.body);
+
+  // Just echo back for now
   res.json({
     isFree: true,
     eventId: null,
-    message: `Echo: ${date} ${time} for ${durationMinutes} minutes looks free.`
+    message: `Echo: ${customerName} wants ${durationMinutes} mins on ${date} at ${time}. Phone: ${customerPhone}`
   });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Listening on " + PORT));
+app.listen(3000, () => console.log("Server running on port 3000"));
