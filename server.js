@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import moment from "moment-timezone";
 import * as chrono from "chrono-node";
@@ -10,6 +11,7 @@ app.use(express.json());
 const DEFAULT_TZ = "America/Los_Angeles";
 const envTZ = process.env.BUSINESS_TZ;
 const TZ = (typeof envTZ === "string" && moment.tz.zone(envTZ)) ? envTZ : DEFAULT_TZ;
+
 const TOOL_SECRET = (process.env.TOOL_SECRET || "").trim();
 const CALENDAR_ID = (process.env.CALENDAR_ID || "primary").trim();
 
@@ -80,7 +82,7 @@ function makeGcalClientOrThrow() {
   }
 
   const oauth2 = new google.auth.OAuth2(cid, csec);
-  oauth2.setCredentials({ refresh_token: rtok }); // <-- if this is empty, Google will throw your exact error
+  oauth2.setCredentials({ refresh_token: rtok });
   return google.calendar({ version: "v3", auth: oauth2 });
 }
 
@@ -144,25 +146,30 @@ app.post("/tools/check-availability", async (req, res) => {
     const body = req.body || {};
     console.log("Got body:", body);
 
-    // Call timestamp
+    // Call timestamp (for fallback defaults)
     const headerTs = req.header("X-Telnyx-Timestamp");
     let callMoment = moment(headerTs ?? body.callTimestamp ?? new Date().toISOString());
     if (!callMoment.isValid()) callMoment = moment();
     callMoment = callMoment.tz(TZ);
 
-    // Inputs
+    // Inputs (accept a few aliases)
     const rawDate = body.date ?? body.Date ?? body["appointment_date"] ?? body["date_requested"];
     const rawTime = body.time ?? body.Time ?? body["appointment_time"] ?? body["time_requested"];
     const rawDuration = body.durationMinutes ?? body.duration ?? body["duration_minutes"] ?? body["appointment_duration"];
     const customerName = body.customerName ?? body["customer_name"] ?? body["customer name"] ?? "";
     const customerEmail = body.customerEmail ?? body["customer_email"] ?? body["customer email"] ?? "";
     const customerPhone = body.customerPhone ?? body["customer_phone"] ?? body["customer phone"] ?? "";
-    const autoBook = Boolean(body.autoBook);
 
-    // Normalize
+    // Robust boolean parsing for autoBook
+    const autoBook =
+      body.autoBook === true ||
+      String(body.autoBook).toLowerCase() === "true";
+
+    // Normalize date/time
     const dateStr = parseDateToYYYYMMDD(rawDate, callMoment);
     const timeStr = parseLocalTimeToHHmm(rawTime, callMoment);
 
+    // Duration (minutes) default 30
     let duration = 30;
     if (rawDuration != null) {
       if (typeof rawDuration === "number") duration = rawDuration;
@@ -172,7 +179,7 @@ app.post("/tools/check-availability", async (req, res) => {
       }
     }
 
-    // Appointment times
+    // Appointment moments
     const apptMoment = moment.tz(`${dateStr} ${timeStr}`, "YYYY-MM-DD HH:mm", TZ);
     const startISO = apptMoment.toISOString();
     const endISO   = apptMoment.clone().add(duration, "minutes").toISOString();
@@ -209,7 +216,7 @@ app.post("/tools/check-availability", async (req, res) => {
       });
     }
 
-    // Auto-book
+    // Auto-book if requested
     let eventId = null;
     if (autoBook) {
       try {
@@ -218,6 +225,7 @@ app.post("/tools/check-availability", async (req, res) => {
         const description =
           `Booked by AI receptionist.\nPhone: ${String(customerPhone || "")}\nEmail: ${String(customerEmail || "")}`;
         const attendees = customerEmail ? [customerEmail] : [];
+
         const ev = await gcal.events.insert({
           calendarId: CALENDAR_ID,
           requestBody: {
@@ -229,12 +237,20 @@ app.post("/tools/check-availability", async (req, res) => {
             reminders: { useDefault: true }
           }
         });
+
         eventId = ev.data.id || null;
       } catch (err) {
         console.error("create event error:", err);
+        return res.status(200).json({
+          isFree: true,
+          eventId: null,
+          message: "Slot is free, but I couldn't create the event.",
+          createError: String(err?.message || err)
+        });
       }
     }
 
+    // Success
     return res.json({
       isFree: true,
       eventId,
