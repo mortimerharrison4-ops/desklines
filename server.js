@@ -5,13 +5,12 @@ import * as chrono from "chrono-node";
 const app = express();
 app.use(express.json());
 
-// ---- Config ----
+// -------- Config (set your tz in Render as BUSINESS_TZ if needed) ----------
 const DEFAULT_TZ = "America/Los_Angeles";
-const TZ = moment.tz.zone(process.env.BUSINESS_TZ || DEFAULT_TZ)
-  ? (process.env.BUSINESS_TZ || DEFAULT_TZ)
-  : DEFAULT_TZ;
+const envTZ = process.env.BUSINESS_TZ;
+const TZ = (typeof envTZ === "string" && moment.tz.zone(envTZ)) ? envTZ : DEFAULT_TZ;
 
-// label morning/afternoon/evening/night
+// -------- Helpers -----------------------------------------------------------
 function timeOfDay(h) {
   if (h >= 5 && h < 12) return "morning";
   if (h >= 12 && h < 17) return "afternoon";
@@ -19,95 +18,96 @@ function timeOfDay(h) {
   return "night";
 }
 
-// Parse a local time string in TZ using only moment (no chrono here)
+// Parse a local time string in TZ using moment only (no chrono here)
 function parseLocalTimeToHHmm(raw, fallbackMoment) {
-  if (!raw) return fallbackMoment.format("HH:mm");
+  try {
+    if (raw == null) return fallbackMoment.format("HH:mm");
+    const s = String(raw).trim();
+    if (s === "") return fallbackMoment.format("HH:mm");
 
-  // already HH:mm?
-  if (/^\d{2}:\d{2}$/.test(raw)) return raw;
+    // Already HH:mm?
+    if (/^\d{2}:\d{2}$/.test(s)) return s;
 
-  // Try a bunch of common formats in strict mode in our TZ
-  const formats = [
-    "h a", "h:mm a", "h.mm a",
-    "ha", "h:mma",
-    "H", "H:mm", "H.mm"
-  ];
-  const m = moment.tz(raw.trim(), formats, TZ, true);
-  if (m.isValid()) return m.format("HH:mm");
-
-  // last resort: just use fallback
-  return fallbackMoment.format("HH:mm");
+    const formats = [
+      "h a", "h:mm a", "h.mm a",
+      "ha", "h:mma",
+      "H", "H:mm", "H.mm"
+    ];
+    const m = moment.tz(s, formats, TZ, true); // strict
+    return m.isValid() ? m.format("HH:mm") : fallbackMoment.format("HH:mm");
+  } catch {
+    return fallbackMoment.format("HH:mm");
+  }
 }
 
+// Safe chrono date parse → YYYY-MM-DD. Falls back to callMoment's date.
+function parseDateToYYYYMMDD(raw, callMoment) {
+  try {
+    if (raw == null) return callMoment.format("YYYY-MM-DD");
+    const s = String(raw).trim();
+    if (s === "") return callMoment.format("YYYY-MM-DD");
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; // already normalized
+
+    const dt = chrono.parseDate(s, callMoment.toDate());
+    if (!dt) return callMoment.format("YYYY-MM-DD");
+    return moment(dt).tz(TZ).format("YYYY-MM-DD");
+  } catch {
+    return callMoment.format("YYYY-MM-DD");
+  }
+}
+
+// ---------------------------------------------------------------------------
 app.get("/", (_req, res) => res.send("ok"));
 
 app.post("/tools/check-availability", (req, res) => {
-  const body = req.body || {};
   try {
-    // When the tool was invoked
-    const rawCallTs =
-      body.callTimestamp ||
-      req.header("X-Telnyx-Timestamp") ||
-      new Date().toISOString();
+    const body = req.body || {};
+    console.log("Got body:", body);
 
-    let callMoment = moment(rawCallTs);
+    // When the tool was invoked (prefer explicit header if Telnyx sends it)
+    const headerTs = req.header("X-Telnyx-Timestamp");
+    let callMoment = moment(headerTs ?? body.callTimestamp ?? new Date().toISOString());
     if (!callMoment.isValid()) callMoment = moment();
     callMoment = callMoment.tz(TZ);
 
-    // Accept a few aliases (be forgiving)
+    // Accept a few aliases and force-string everything
     const rawDate =
-      body.date || body.Date || body["appointment_date"] || body["date_requested"];
+      body.date ?? body.Date ?? body["appointment_date"] ?? body["date_requested"];
     const rawTime =
-      body.time || body.Time || body["appointment_time"] || body["time_requested"];
+      body.time ?? body.Time ?? body["appointment_time"] ?? body["time_requested"];
     const rawDuration =
-      body.durationMinutes || body.duration || body["duration_minutes"] || body["appointment_duration"];
+      body.durationMinutes ?? body.duration ?? body["duration_minutes"] ?? body["appointment_duration"];
 
     const customerName =
-      body.customerName || body["customer_name"] || body["customer name"];
+      body.customerName ?? body["customer_name"] ?? body["customer name"] ?? "";
     const customerEmail =
-      body.customerEmail || body["customer_email"] || body["customer email"];
+      body.customerEmail ?? body["customer_email"] ?? body["customer email"] ?? "";
     const customerPhone =
-      body.customerPhone || body["customer_phone"] || body["customer phone"];
+      body.customerPhone ?? body["customer_phone"] ?? body["customer phone"] ?? "";
 
-    // ---- Date -> YYYY-MM-DD (assume caller speaks in TZ) ----
-    let dateStr;
-    if (rawDate) {
-      if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
-        dateStr = rawDate;
-      } else {
-        const parsedDate = chrono.parseDate(rawDate, callMoment.toDate());
-        dateStr = parsedDate
-          ? moment(parsedDate).tz(TZ).format("YYYY-MM-DD")
-          : callMoment.format("YYYY-MM-DD");
-      }
-    } else {
-      dateStr = callMoment.format("YYYY-MM-DD");
-    }
-
-    // ---- Time -> HH:mm (interpret as local TZ) ----
+    // Normalize date/time/duration
+    const dateStr = parseDateToYYYYMMDD(rawDate, callMoment);
     const timeStr = parseLocalTimeToHHmm(rawTime, callMoment);
 
-    // ---- Duration -> minutes (default 30) ----
     let duration = 30;
     if (rawDuration != null) {
       if (typeof rawDuration === "number") duration = rawDuration;
-      else if (typeof rawDuration === "string") {
-        const num = parseInt(rawDuration.replace(/\D/g, ""), 10);
-        if (!isNaN(num)) duration = num;
+      else {
+        const n = parseInt(String(rawDuration).replace(/\D/g, ""), 10);
+        if (!isNaN(n)) duration = n;
       }
     }
 
-    // Compose appointment moment in TZ
+    // Appointment moment in your business TZ
     const apptMoment = moment.tz(`${dateStr} ${timeStr}`, "YYYY-MM-DD HH:mm", TZ);
 
-    // Friendly message (calendar check comes later)
     const msg =
-      `Echo: ${customerName || "Unknown"} wants ${duration} mins ` +
+      `Echo: ${String(customerName || "Unknown")} wants ${duration} mins ` +
       `on ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} (${timeOfDay(apptMoment.hour())}). ` +
-      `Phone: ${customerPhone || "??"}`;
+      `Phone: ${String(customerPhone || "??")}`;
 
     return res.json({
-      isFree: true,    // placeholder until Google/Outlook check is wired
+      isFree: true,     // still a placeholder; we’ll wire calendar next
       eventId: null,
       message: msg,
       call: {
@@ -130,7 +130,7 @@ app.post("/tools/check-availability", (req, res) => {
     });
   } catch (err) {
     console.error("Handler error:", err);
-    // Return JSON (not HTML) so Telnyx tool UI shows a clear error
+    // Always return JSON (not HTML) so Telnyx UI shows a clear error
     return res.status(200).json({
       isFree: false,
       eventId: null,
