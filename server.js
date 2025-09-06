@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import moment from "moment-timezone";
 import * as chrono from "chrono-node";
@@ -7,25 +6,14 @@ import { google } from "googleapis";
 const app = express();
 app.use(express.json());
 
-// ------------- Config / Env -----------------
+// ---------- Config ----------
 const DEFAULT_TZ = "America/Los_Angeles";
 const envTZ = process.env.BUSINESS_TZ;
 const TZ = (typeof envTZ === "string" && moment.tz.zone(envTZ)) ? envTZ : DEFAULT_TZ;
+const TOOL_SECRET = (process.env.TOOL_SECRET || "").trim();
+const CALENDAR_ID = (process.env.CALENDAR_ID || "primary").trim();
 
-const TOOL_SECRET = process.env.TOOL_SECRET || ""; // must match Telnyx header
-
-// Google API Client
-const oauth2 = new google.auth.OAuth2(
-  process.env.GCAL_CLIENT_ID,
-  process.env.GCAL_CLIENT_SECRET
-);
-if (process.env.GCAL_REFRESH_TOKEN) {
-  oauth2.setCredentials({ refresh_token: process.env.GCAL_REFRESH_TOKEN });
-}
-const gcal = google.calendar({ version: "v3", auth: oauth2 });
-const CALENDAR_ID = process.env.CALENDAR_ID || "primary";
-
-// ------------- Helpers ----------------------
+// ---------- Helpers ----------
 function timeOfDay(h) {
   if (h >= 5 && h < 12) return "morning";
   if (h >= 12 && h < 17) return "afternoon";
@@ -33,7 +21,6 @@ function timeOfDay(h) {
   return "night";
 }
 
-// Natural language date -> YYYY-MM-DD (safe)
 function parseDateToYYYYMMDD(raw, callMoment) {
   try {
     if (raw == null) return callMoment.format("YYYY-MM-DD");
@@ -48,14 +35,12 @@ function parseDateToYYYYMMDD(raw, callMoment) {
   }
 }
 
-// Local time text -> "HH:mm" (regex only; no tz parsing)
 function parseLocalTimeToHHmm(raw, fallbackMoment) {
   try {
     if (raw == null) return fallbackMoment.format("HH:mm");
     const s = String(raw).trim();
     if (s === "") return fallbackMoment.format("HH:mm");
-
-    if (/^\d{2}:\d{2}$/.test(s)) return s; // already 24h
+    if (/^\d{2}:\d{2}$/.test(s)) return s;
 
     const ampm = s.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap]m)$/i);
     if (ampm) {
@@ -79,64 +64,79 @@ function parseLocalTimeToHHmm(raw, fallbackMoment) {
   }
 }
 
-// Google helpers
-async function gcalIsFreeISO(startISO, endISO, tz) {
-  const fb = await gcal.freebusy.query({
-    requestBody: {
-      timeMin: startISO,
-      timeMax: endISO,
-      timeZone: tz,
-      items: [{ id: CALENDAR_ID }]
-    }
-  });
-  const busy = fb.data.calendars?.[CALENDAR_ID]?.busy || [];
-  return busy.length === 0;
+// Build a fresh Google Calendar client each time (so env is current)
+function makeGcalClientOrThrow() {
+  const cid  = (process.env.GCAL_CLIENT_ID || "").trim();
+  const csec = (process.env.GCAL_CLIENT_SECRET || "").trim();
+  const rtok = (process.env.GCAL_REFRESH_TOKEN || "").trim();
+
+  const missing = {
+    GCAL_CLIENT_ID: !!cid,
+    GCAL_CLIENT_SECRET: !!csec,
+    GCAL_REFRESH_TOKEN: !!rtok
+  };
+  if (!missing.GCAL_CLIENT_ID || !missing.GCAL_CLIENT_SECRET || !missing.GCAL_REFRESH_TOKEN) {
+    throw new Error("Missing Google creds: " + JSON.stringify(missing));
+  }
+
+  const oauth2 = new google.auth.OAuth2(cid, csec);
+  oauth2.setCredentials({ refresh_token: rtok }); // <-- if this is empty, Google will throw your exact error
+  return google.calendar({ version: "v3", auth: oauth2 });
 }
 
-async function gcalCreateEventISO({ startISO, endISO, tz, summary, description, attendees = [] }) {
-  const ev = await gcal.events.insert({
-    calendarId: CALENDAR_ID,
-    requestBody: {
-      summary,
-      description,
-      start: { dateTime: startISO, timeZone: tz },
-      end:   { dateTime: endISO,   timeZone: tz },
-      attendees: attendees.filter(Boolean).map(e => ({ email: e })),
-      reminders: { useDefault: true }
-    }
-  });
-  return ev.data.id || null;
-}
-
-// ------------- Debug routes -----------------
+// ---------- Debug routes ----------
 app.get("/", (_req, res) => res.send("ok"));
 
 app.get("/debug/env", (_req, res) => {
   res.json({
     tz: TZ,
-    hasClientId: !!process.env.GCAL_CLIENT_ID,
-    hasClientSecret: !!process.env.GCAL_CLIENT_SECRET,
-    hasRefreshToken: !!process.env.GCAL_REFRESH_TOKEN,
+    hasClientId: !!(process.env.GCAL_CLIENT_ID || "").trim(),
+    hasClientSecret: !!(process.env.GCAL_CLIENT_SECRET || "").trim(),
+    hasRefreshToken: !!(process.env.GCAL_REFRESH_TOKEN || "").trim(),
     calendarId: CALENDAR_ID,
     hasToolSecret: !!TOOL_SECRET
   });
 });
 
+app.get("/debug/env/strict", (_req, res) => {
+  const cid  = (process.env.GCAL_CLIENT_ID || "");
+  const csec = (process.env.GCAL_CLIENT_SECRET || "");
+  const rtok = (process.env.GCAL_REFRESH_TOKEN || "");
+  res.json({
+    cid_len: cid.length,
+    cid_start: cid.slice(0, 8),
+    csec_len: csec.length,
+    csec_start: csec.slice(0, 6),
+    rtok_len: rtok.length,
+    rtok_start: rtok.slice(0, 6),
+    note: "Lengths shown so you can detect accidental blanks/newlines without revealing secrets."
+  });
+});
+
 app.get("/debug/freebusy", async (_req, res) => {
   try {
+    const gcal = makeGcalClientOrThrow();
     const now = moment().tz(TZ);
     const end = now.clone().add(30, "minutes");
-    const ok = await gcalIsFreeISO(now.toISOString(), end.toISOString(), TZ);
-    res.json({ ok: true, free: ok });
+    const fb = await gcal.freebusy.query({
+      requestBody: {
+        timeMin: now.toISOString(),
+        timeMax: end.toISOString(),
+        timeZone: TZ,
+        items: [{ id: CALENDAR_ID }]
+      }
+    });
+    const busy = fb.data.calendars?.[CALENDAR_ID]?.busy || [];
+    res.json({ ok: true, free: busy.length === 0, busy });
   } catch (e) {
     res.status(200).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// ------------- Main webhook -----------------
+// ---------- Main webhook ----------
 app.post("/tools/check-availability", async (req, res) => {
   try {
-    // Optional: lock down with shared secret
+    // Optional auth
     if (TOOL_SECRET && req.get("X-Auth-Token") !== TOOL_SECRET) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -144,17 +144,16 @@ app.post("/tools/check-availability", async (req, res) => {
     const body = req.body || {};
     console.log("Got body:", body);
 
-    // When the tool was invoked
+    // Call timestamp
     const headerTs = req.header("X-Telnyx-Timestamp");
     let callMoment = moment(headerTs ?? body.callTimestamp ?? new Date().toISOString());
     if (!callMoment.isValid()) callMoment = moment();
     callMoment = callMoment.tz(TZ);
 
-    // Accept aliases
+    // Inputs
     const rawDate = body.date ?? body.Date ?? body["appointment_date"] ?? body["date_requested"];
     const rawTime = body.time ?? body.Time ?? body["appointment_time"] ?? body["time_requested"];
     const rawDuration = body.durationMinutes ?? body.duration ?? body["duration_minutes"] ?? body["appointment_duration"];
-
     const customerName = body.customerName ?? body["customer_name"] ?? body["customer name"] ?? "";
     const customerEmail = body.customerEmail ?? body["customer_email"] ?? body["customer email"] ?? "";
     const customerPhone = body.customerPhone ?? body["customer_phone"] ?? body["customer phone"] ?? "";
@@ -173,51 +172,69 @@ app.post("/tools/check-availability", async (req, res) => {
       }
     }
 
-    // Appointment
+    // Appointment times
     const apptMoment = moment.tz(`${dateStr} ${timeStr}`, "YYYY-MM-DD HH:mm", TZ);
     const startISO = apptMoment.toISOString();
     const endISO   = apptMoment.clone().add(duration, "minutes").toISOString();
 
-    // --- Google: free/busy ---
+    // Google free/busy
     let isFree = false;
     try {
-      isFree = await gcalIsFreeISO(startISO, endISO, TZ);
+      const gcal = makeGcalClientOrThrow();
+      const fb = await gcal.freebusy.query({
+        requestBody: {
+          timeMin: startISO,
+          timeMax: endISO,
+          timeZone: TZ,
+          items: [{ id: CALENDAR_ID }]
+        }
+      });
+      const busy = fb.data.calendars?.[CALENDAR_ID]?.busy || [];
+      isFree = busy.length === 0;
+
+      if (!isFree) {
+        return res.json({
+          isFree: false,
+          eventId: null,
+          message: `Sorry, ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} is already booked.`
+        });
+      }
     } catch (err) {
       console.error("freebusy error:", err);
       return res.status(200).json({
         isFree: false,
         eventId: null,
-        message: "I couldn't check the calendar right now. Please try again.",
+        message: "Google auth is not ready. Check env or refresh token.",
         error: String(err?.message || err)
       });
     }
 
-    if (!isFree) {
-      return res.json({
-        isFree: false,
-        eventId: null,
-        message: `Sorry, ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} is already booked.`
-      });
-    }
-
-    // --- Auto-book if requested ---
+    // Auto-book
     let eventId = null;
     if (autoBook) {
       try {
+        const gcal = makeGcalClientOrThrow();
         const summary = `Appointment – ${String(customerName || "Customer")}`;
         const description =
           `Booked by AI receptionist.\nPhone: ${String(customerPhone || "")}\nEmail: ${String(customerEmail || "")}`;
         const attendees = customerEmail ? [customerEmail] : [];
-        eventId = await gcalCreateEventISO({
-          startISO, endISO, tz: TZ, summary, description, attendees
+        const ev = await gcal.events.insert({
+          calendarId: CALENDAR_ID,
+          requestBody: {
+            summary,
+            description,
+            start: { dateTime: startISO, timeZone: TZ },
+            end:   { dateTime: endISO,   timeZone: TZ },
+            attendees: attendees.map(e => ({ email: e })),
+            reminders: { useDefault: true }
+          }
         });
+        eventId = ev.data.id || null;
       } catch (err) {
         console.error("create event error:", err);
-        // continue; we'll still return that it's free
       }
     }
 
-    // Success response
     return res.json({
       isFree: true,
       eventId,
@@ -242,7 +259,6 @@ app.post("/tools/check-availability", async (req, res) => {
       },
       received: body
     });
-
   } catch (err) {
     console.error("Handler error:", err);
     return res.status(200).json({
