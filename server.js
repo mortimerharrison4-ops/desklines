@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import moment from "moment-timezone";
 import * as chrono from "chrono-node";
@@ -23,18 +22,35 @@ function timeOfDay(h) {
   return "night";
 }
 
-function parseDateToYYYYMMDD(raw, callMoment) {
-  try {
-    if (raw == null) return callMoment.format("YYYY-MM-DD");
-    const s = String(raw).trim();
-    if (s === "") return callMoment.format("YYYY-MM-DD");
-    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-    const dt = chrono.parseDate(s, callMoment.toDate());
-    if (!dt) return callMoment.format("YYYY-MM-DD");
-    return moment(dt).tz(TZ).format("YYYY-MM-DD");
-  } catch {
-    return callMoment.format("YYYY-MM-DD");
+/**
+ * Normalize a caller-provided date phrase.
+ * - If we can parse, return YYYY-MM-DD and normalized=true.
+ * - If we can't, return today's YYYY-MM-DD (so the flow doesn't crash),
+ *   but also return normalized=false and keep the original phrase
+ *   so the assistant can confirm with the caller.
+ */
+function normalizeDate(raw, callMoment) {
+  const original = raw == null ? "" : String(raw).trim();
+
+  // Already ISO? Done.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(original)) {
+    return { value: original, normalized: true, original };
   }
+
+  // Try chrono with forward bias (e.g., "october 1", "next friday")
+  try {
+    if (original) {
+      const dt = chrono.parseDate(original, callMoment.toDate(), { forwardDate: true });
+      if (dt) {
+        return { value: moment(dt).tz(TZ).format("YYYY-MM-DD"), normalized: true, original };
+      }
+    }
+  } catch {
+    // fall through to fallback
+  }
+
+  // Fallback: keep the flow alive using today's date, but mark not normalized
+  return { value: callMoment.format("YYYY-MM-DD"), normalized: false, original };
 }
 
 function parseLocalTimeToHHmm(raw, fallbackMoment) {
@@ -165,8 +181,11 @@ app.post("/tools/check-availability", async (req, res) => {
       body.autoBook === true ||
       String(body.autoBook).toLowerCase() === "true";
 
-    // Normalize date/time
-    const dateStr = parseDateToYYYYMMDD(rawDate, callMoment);
+    // --- NEW: normalize date with future bias, but keep the phrase if we can't parse
+    const { value: dateStr, normalized: dateNormalized, original: originalDatePhrase } =
+      normalizeDate(rawDate, callMoment);
+
+    // Time normalize (kept same behavior)
     const timeStr = parseLocalTimeToHHmm(rawTime, callMoment);
 
     // Duration (minutes) default 30
@@ -271,7 +290,10 @@ app.post("/tools/check-availability", async (req, res) => {
         iso: startISO,
         timeOfDay: timeOfDay(apptMoment.hour()),
         durationMinutes: duration,
-        timezone: TZ
+        timezone: TZ,
+        // NEW: expose normalization so the assistant can confirm if needed
+        originalDatePhrase,
+        normalizedDate: dateNormalized
       },
       received: body
     });
