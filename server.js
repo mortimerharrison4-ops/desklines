@@ -22,35 +22,25 @@ function timeOfDay(h) {
   return "night";
 }
 
-/**
- * Normalize a caller-provided date phrase.
- * - If we can parse, return YYYY-MM-DD and normalized=true.
- * - If we can't, return today's YYYY-MM-DD (so the flow doesn't crash),
- *   but also return normalized=false and keep the original phrase
- *   so the assistant can confirm with the caller.
- */
-function normalizeDate(raw, callMoment) {
-  const original = raw == null ? "" : String(raw).trim();
-
-  // Already ISO? Done.
-  if (/^\d{4}-\d{2}-\d{2}$/.test(original)) {
-    return { value: original, normalized: true, original };
-  }
-
-  // Try chrono with forward bias (e.g., "october 1", "next friday")
+// Updated date parser: If caller gives YYYY-MM-DD, use it. Otherwise, try chrono; if nothing matches, return raw phrase.
+function parseDateToYYYYMMDD(raw, callMoment) {
   try {
-    if (original) {
-      const dt = chrono.parseDate(original, callMoment.toDate(), { forwardDate: true });
-      if (dt) {
-        return { value: moment(dt).tz(TZ).format("YYYY-MM-DD"), normalized: true, original };
-      }
-    }
-  } catch {
-    // fall through to fallback
-  }
+    if (raw == null) return callMoment.format("YYYY-MM-DD");
+    const s = String(raw).trim();
+    if (s === "") return callMoment.format("YYYY-MM-DD");
 
-  // Fallback: keep the flow alive using today's date, but mark not normalized
-  return { value: callMoment.format("YYYY-MM-DD"), normalized: false, original };
+    // Already in ISO format
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+    // Try chrono with forward bias
+    let dt = chrono.parseDate(s, callMoment.toDate(), { forwardDate: true });
+    if (dt) return moment(dt).tz(TZ).format("YYYY-MM-DD");
+
+    // Fallback: return the phrase directly if parsing failed
+    return s;
+  } catch {
+    return String(raw);
+  }
 }
 
 function parseLocalTimeToHHmm(raw, fallbackMoment) {
@@ -176,16 +166,11 @@ app.post("/tools/check-availability", async (req, res) => {
     const customerEmail = body.customerEmail ?? body["customer_email"] ?? body["customer email"] ?? "";
     const customerPhone = body.customerPhone ?? body["customer_phone"] ?? body["customer phone"] ?? "";
 
-    // Robust boolean parsing for autoBook
-    const autoBook =
-      body.autoBook === true ||
-      String(body.autoBook).toLowerCase() === "true";
+    // Auto-book always (no confirmation stage)
+const autoBook = true;
 
-    // --- NEW: normalize date with future bias, but keep the phrase if we can't parse
-    const { value: dateStr, normalized: dateNormalized, original: originalDatePhrase } =
-      normalizeDate(rawDate, callMoment);
-
-    // Time normalize (kept same behavior)
+    // Normalize date/time
+    const dateStr = parseDateToYYYYMMDD(rawDate, callMoment);
     const timeStr = parseLocalTimeToHHmm(rawTime, callMoment);
 
     // Duration (minutes) default 30
@@ -226,35 +211,15 @@ app.post("/tools/check-availability", async (req, res) => {
         });
       }
     } catch (err) {
-      console.error("freebusy error:", err);
-      return res.status(200).json({
-        isFree: false,
-        eventId: null,
-        message: "Google auth is not ready. Check env or refresh token.",
-        error: String(err?.message || err)
-      });
-    }
-
-    // Auto-book if requested
-    let eventId = null;
-    if (autoBook) {
-      try {
-        const gcal = makeGcalClientOrThrow();
-        const summary = `Appointment – ${String(customerName || "Customer")}`;
-        const description =
-          `Booked by AI receptionist.\nPhone: ${String(customerPhone || "")}\nEmail: ${String(customerEmail || "")}`;
-        const attendees = customerEmail ? [customerEmail] : [];
-
-        const ev = await gcal.events.insert({
-          calendarId: CALENDAR_ID,
-          requestBody: {
-            summary,
-            description,
-            start: { dateTime: startISO, timeZone: TZ },
-            end:   { dateTime: endISO,   timeZone: TZ },
-            attendees: attendees.map(e => ({ email: e })),
-            reminders: { useDefault: true }
-          }
+    console.error("create event error:", err);
+    return res.status(200).json({
+      isFree: true,
+      eventId: null,
+      message: "Slot is free, but I couldn't create the event.",
+      createError: String(err?.message || err)
+    });
+  }
+}
         });
 
         eventId = ev.data.id || null;
@@ -269,34 +234,28 @@ app.post("/tools/check-availability", async (req, res) => {
       }
     }
 
-    // Success
-    return res.json({
-      isFree: true,
-      eventId,
-      message: eventId
-        ? `Booked ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} for ${duration} minutes.`
-        : `That slot is free. Would you like me to book it?`,
-      call: {
-        iso: callMoment.toISOString(),
-        local: callMoment.format("YYYY-MM-DD HH:mm"),
-        timeOfDay: timeOfDay(callMoment.hour()),
-        timezone: TZ
-      },
-      appointment: {
-        date: apptMoment.format("YYYY-MM-DD"),
-        time24: apptMoment.format("HH:mm"),
-        time12: apptMoment.format("h:mm a"),
-        local: apptMoment.format("YYYY-MM-DD HH:mm"),
-        iso: startISO,
-        timeOfDay: timeOfDay(apptMoment.hour()),
-        durationMinutes: duration,
-        timezone: TZ,
-        // NEW: expose normalization so the assistant can confirm if needed
-        originalDatePhrase,
-        normalizedDate: dateNormalized
-      },
-      received: body
-    });
+    // Success — always return the booked confirmation
+return res.json({
+  isFree: true,
+  eventId,
+  message: `Booked ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} for ${duration} minutes.`,
+  call: {
+    iso: callMoment.toISOString(),
+    local: callMoment.format("YYYY-MM-DD HH:mm"),
+    timeOfDay: timeOfDay(callMoment.hour()),
+    timezone: TZ
+  },
+  appointment: {
+    date: apptMoment.format("YYYY-MM-DD"),
+    time24: apptMoment.format("HH:mm"),
+    time12: apptMoment.format("h:mm a"),
+    local: apptMoment.format("YYYY-MM-DD HH:mm"),
+    iso: startISO,
+    timeOfDay: timeOfDay(apptMoment.hour()),
+    durationMinutes: duration,
+    timezone: TZ
+  }
+});
   } catch (err) {
     console.error("Handler error:", err);
     return res.status(200).json({
