@@ -22,25 +22,35 @@ function timeOfDay(h) {
   return "night";
 }
 
-// Updated date parser: If caller gives YYYY-MM-DD, use it. Otherwise, try chrono; if nothing matches, return raw phrase.
-function parseDateToYYYYMMDD(raw, callMoment) {
-  try {
-    if (raw == null) return callMoment.format("YYYY-MM-DD");
-    const s = String(raw).trim();
-    if (s === "") return callMoment.format("YYYY-MM-DD");
+/**
+ * Normalize a caller-provided date phrase.
+ * - If we can parse, return YYYY-MM-DD and normalized=true.
+ * - If we can't, return today's YYYY-MM-DD (so the flow doesn't crash),
+ *   but also return normalized=false and keep the original phrase
+ *   so the assistant can confirm with the caller.
+ */
+function normalizeDate(raw, callMoment) {
+  const original = raw == null ? "" : String(raw).trim();
 
-    // Already in ISO format
-    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-
-    // Try chrono with forward bias
-    let dt = chrono.parseDate(s, callMoment.toDate(), { forwardDate: true });
-    if (dt) return moment(dt).tz(TZ).format("YYYY-MM-DD");
-
-    // Fallback: return the phrase directly if parsing failed
-    return s;
-  } catch {
-    return String(raw);
+  // Already ISO? Done.
+  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(original)) {
+    return { value: original, normalized: true, original };
   }
+
+  // Try chrono with forward bias (e.g., "october 1", "next friday")
+  try {
+    if (original) {
+      const dt = chrono.parseDate(original, callMoment.toDate(), { forwardDate: true });
+      if (dt) {
+        return { value: moment(dt).tz(TZ).format("YYYY-MM-DD"), normalized: true, original };
+      }
+    }
+  } catch {
+    // fall through to fallback
+  }
+
+  // Fallback: keep the flow alive using today's date, but mark not normalized
+  return { value: callMoment.format("YYYY-MM-DD"), normalized: false, original };
 }
 
 function parseLocalTimeToHHmm(raw, fallbackMoment) {
@@ -48,9 +58,9 @@ function parseLocalTimeToHHmm(raw, fallbackMoment) {
     if (raw == null) return fallbackMoment.format("HH:mm");
     const s = String(raw).trim();
     if (s === "") return fallbackMoment.format("HH:mm");
-    if (/^\d{2}:\d{2}$/.test(s)) return s;
+    if (/^\\d{2}:\\d{2}$/.test(s)) return s;
 
-    const ampm = s.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap]m)$/i);
+    const ampm = s.match(/^(\\d{1,2})(?::(\\d{2}))?\\s*([ap]m)$/i);
     if (ampm) {
       let hour = parseInt(ampm[1], 10);
       const minute = ampm[2] ? parseInt(ampm[2], 10) : 0;
@@ -60,7 +70,7 @@ function parseLocalTimeToHHmm(raw, fallbackMoment) {
       return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
     }
 
-    const hourOnly = s.match(/^(\d{1,2})$/);
+    const hourOnly = s.match(/^(\\d{1,2})$/);
     if (hourOnly) {
       const hour = Math.max(0, Math.min(23, parseInt(hourOnly[1], 10)));
       return `${String(hour).padStart(2, "0")}:00`;
@@ -144,7 +154,6 @@ app.get("/debug/freebusy", async (_req, res) => {
 // ---------- Main webhook ----------
 app.post("/tools/check-availability", async (req, res) => {
   try {
-    // Optional auth
     if (TOOL_SECRET && req.get("X-Auth-Token") !== TOOL_SECRET) {
       return res.status(401).json({ message: "Unauthorized" });
     }
@@ -152,13 +161,11 @@ app.post("/tools/check-availability", async (req, res) => {
     const body = req.body || {};
     console.log("Got body:", body);
 
-    // Call timestamp (for fallback defaults)
     const headerTs = req.header("X-Telnyx-Timestamp");
     let callMoment = moment(headerTs ?? body.callTimestamp ?? new Date().toISOString());
     if (!callMoment.isValid()) callMoment = moment();
     callMoment = callMoment.tz(TZ);
 
-    // Inputs (accept a few aliases)
     const rawDate = body.date ?? body.Date ?? body["appointment_date"] ?? body["date_requested"];
     const rawTime = body.time ?? body.Time ?? body["appointment_time"] ?? body["time_requested"];
     const rawDuration = body.durationMinutes ?? body.duration ?? body["duration_minutes"] ?? body["appointment_duration"];
@@ -166,29 +173,28 @@ app.post("/tools/check-availability", async (req, res) => {
     const customerEmail = body.customerEmail ?? body["customer_email"] ?? body["customer email"] ?? "";
     const customerPhone = body.customerPhone ?? body["customer_phone"] ?? body["customer phone"] ?? "";
 
-    // Auto-book always (no confirmation stage)
-const autoBook = true;
+    // Always auto-book (no confirmation step)
+    const autoBook = true;
 
-    // Normalize date/time
-    const dateStr = parseDateToYYYYMMDD(rawDate, callMoment);
+    // Normalize date with future bias, but keep the phrase if we can't parse
+    const { value: dateStr, normalized: dateNormalized, original: originalDatePhrase } =
+      normalizeDate(rawDate, callMoment);
+
     const timeStr = parseLocalTimeToHHmm(rawTime, callMoment);
 
-    // Duration (minutes) default 30
     let duration = 30;
     if (rawDuration != null) {
       if (typeof rawDuration === "number") duration = rawDuration;
       else {
-        const n = parseInt(String(rawDuration).replace(/\D/g, ""), 10);
+        const n = parseInt(String(rawDuration).replace(/\\D/g, ""), 10);
         if (!isNaN(n)) duration = n;
       }
     }
 
-    // Appointment moments
     const apptMoment = moment.tz(`${dateStr} ${timeStr}`, "YYYY-MM-DD HH:mm", TZ);
     const startISO = apptMoment.toISOString();
     const endISO   = apptMoment.clone().add(duration, "minutes").toISOString();
 
-    // Google free/busy
     let isFree = false;
     try {
       const gcal = makeGcalClientOrThrow();
@@ -211,51 +217,68 @@ const autoBook = true;
         });
       }
     } catch (err) {
-    console.error("create event error:", err);
-    return res.status(200).json({
-      isFree: true,
-      eventId: null,
-      message: "Slot is free, but I couldn't create the event.",
-      createError: String(err?.message || err)
-    });
-  }
-}
-        });
-
-        eventId = ev.data.id || null;
-      } catch (err) {
-        console.error("create event error:", err);
-        return res.status(200).json({
-          isFree: true,
-          eventId: null,
-          message: "Slot is free, but I couldn't create the event.",
-          createError: String(err?.message || err)
-        });
-      }
+      console.error("freebusy error:", err);
+      return res.status(200).json({
+        isFree: false,
+        eventId: null,
+        message: "Google auth is not ready. Check env or refresh token.",
+        error: String(err?.message || err)
+      });
     }
 
-    // Success — always return the booked confirmation
-return res.json({
-  isFree: true,
-  eventId,
-  message: `Booked ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} for ${duration} minutes.`,
-  call: {
-    iso: callMoment.toISOString(),
-    local: callMoment.format("YYYY-MM-DD HH:mm"),
-    timeOfDay: timeOfDay(callMoment.hour()),
-    timezone: TZ
-  },
-  appointment: {
-    date: apptMoment.format("YYYY-MM-DD"),
-    time24: apptMoment.format("HH:mm"),
-    time12: apptMoment.format("h:mm a"),
-    local: apptMoment.format("YYYY-MM-DD HH:mm"),
-    iso: startISO,
-    timeOfDay: timeOfDay(apptMoment.hour()),
-    durationMinutes: duration,
-    timezone: TZ
-  }
-});
+    let eventId = null;
+    try {
+      const gcal = makeGcalClientOrThrow();
+      const summary = `Appointment – ${String(customerName || "Customer")}`;
+      const description = `Booked by AI receptionist.\\nPhone: ${String(customerPhone || "")}\\nEmail: ${String(customerEmail || "")}`;
+      const attendees = customerEmail ? [customerEmail] : [];
+
+      const ev = await gcal.events.insert({
+        calendarId: CALENDAR_ID,
+        requestBody: {
+          summary,
+          description,
+          start: { dateTime: startISO, timeZone: TZ },
+          end:   { dateTime: endISO,   timeZone: TZ },
+          attendees: attendees.map(e => ({ email: e })),
+          reminders: { useDefault: true }
+        }
+      });
+
+      eventId = ev.data.id || null;
+    } catch (err) {
+      console.error("create event error:", err);
+      return res.status(200).json({
+        isFree: true,
+        eventId: null,
+        message: "Slot is free, but I couldn't create the event.",
+        createError: String(err?.message || err)
+      });
+    }
+
+    return res.json({
+      isFree: true,
+      eventId,
+      message: `Booked ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} for ${duration} minutes.`,
+      call: {
+        iso: callMoment.toISOString(),
+        local: callMoment.format("YYYY-MM-DD HH:mm"),
+        timeOfDay: timeOfDay(callMoment.hour()),
+        timezone: TZ
+      },
+      appointment: {
+        date: apptMoment.format("YYYY-MM-DD"),
+        time24: apptMoment.format("HH:mm"),
+        time12: apptMoment.format("h:mm a"),
+        local: apptMoment.format("YYYY-MM-DD HH:mm"),
+        iso: startISO,
+        timeOfDay: timeOfDay(apptMoment.hour()),
+        durationMinutes: duration,
+        timezone: TZ,
+        originalDatePhrase,
+        normalizedDate: dateNormalized
+      }
+    });
   } catch (err) {
     console.error("Handler error:", err);
     return res.status(200).json({
