@@ -22,45 +22,45 @@ function timeOfDay(h) {
   return "night";
 }
 
-/**
- * Normalize a caller-provided date phrase.
- * - If we can parse, return YYYY-MM-DD and normalized=true.
- * - If we can't, return today's YYYY-MM-DD (so the flow doesn't crash),
- *   but also return normalized=false and keep the original phrase
- *   so the assistant can confirm with the caller.
- */
+// Robust date normalization: try to parse; if we can't, return null so we NEVER fall back to now
 function normalizeDate(raw, callMoment) {
-  const original = raw == null ? "" : String(raw).trim();
-
-  // Already ISO? Done.
-  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(original)) {
-    return { value: original, normalized: true, original };
-  }
-
-  // Try chrono with forward bias (e.g., "october 1", "next friday")
   try {
-    if (original) {
-      const dt = chrono.parseDate(original, callMoment.toDate(), { forwardDate: true });
-      if (dt) {
-        return { value: moment(dt).tz(TZ).format("YYYY-MM-DD"), normalized: true, original };
+    if (raw == null) return null; // force caller to provide one
+    const s = String(raw).trim();
+    if (s === "") return null;
+
+    // already ISO
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return { value: s, source: "iso" };
+
+    // chrono with future bias
+    const dt = chrono.parseDate(s, callMoment.toDate(), { forwardDate: true });
+    if (dt) return { value: moment(dt).tz(TZ).format("YYYY-MM-DD"), source: "chrono" };
+
+    // strict fallbacks (assume current year, roll forward if in past)
+    const formats = ["MMMM D", "MMM D", "D MMMM", "D MMM", "M/D", "M-D", "MM/DD", "MM-DD"]; 
+    for (const f of formats) {
+      const tmp = moment.tz(s, f, TZ, true);
+      if (tmp.isValid()) {
+        let m2 = tmp.year(callMoment.year());
+        if (m2.endOf("day").isBefore(callMoment)) m2 = m2.add(1, "year");
+        return { value: m2.format("YYYY-MM-DD"), source: "fallback" };
       }
     }
-  } catch {
-    // fall through to fallback
-  }
 
-  // Fallback: keep the flow alive using today's date, but mark not normalized
-  return { value: callMoment.format("YYYY-MM-DD"), normalized: false, original };
+    return null; // unknown phrase → require clarification
+  } catch {
+    return null;
+  }
 }
 
-function parseLocalTimeToHHmm(raw, fallbackMoment) {
+function parseLocalTimeToHHmm(raw, _fallbackMoment) {
   try {
-    if (raw == null) return fallbackMoment.format("HH:mm");
+    if (raw == null) return null;
     const s = String(raw).trim();
-    if (s === "") return fallbackMoment.format("HH:mm");
-    if (/^\\d{2}:\\d{2}$/.test(s)) return s;
+    if (s === "") return null;
+    if (/^\d{2}:\d{2}$/.test(s)) return s;
 
-    const ampm = s.match(/^(\\d{1,2})(?::(\\d{2}))?\\s*([ap]m)$/i);
+    const ampm = s.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap]m)$/i);
     if (ampm) {
       let hour = parseInt(ampm[1], 10);
       const minute = ampm[2] ? parseInt(ampm[2], 10) : 0;
@@ -70,19 +70,18 @@ function parseLocalTimeToHHmm(raw, fallbackMoment) {
       return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
     }
 
-    const hourOnly = s.match(/^(\\d{1,2})$/);
+    const hourOnly = s.match(/^(\d{1,2})$/);
     if (hourOnly) {
       const hour = Math.max(0, Math.min(23, parseInt(hourOnly[1], 10)));
       return `${String(hour).padStart(2, "0")}:00`;
     }
 
-    return fallbackMoment.format("HH:mm");
+    return null; // don't fall back to now
   } catch {
-    return fallbackMoment.format("HH:mm");
+    return null;
   }
 }
 
-// Build a fresh Google Calendar client each time (so env is current)
 function makeGcalClientOrThrow() {
   const cid  = (process.env.GCAL_CLIENT_ID || "").trim();
   const csec = (process.env.GCAL_CLIENT_SECRET || "").trim();
@@ -173,25 +172,53 @@ app.post("/tools/check-availability", async (req, res) => {
     const customerEmail = body.customerEmail ?? body["customer_email"] ?? body["customer email"] ?? "";
     const customerPhone = body.customerPhone ?? body["customer_phone"] ?? body["customer phone"] ?? "";
 
-    // Always auto-book (no confirmation step)
+    // Always auto-book
     const autoBook = true;
 
-    // Normalize date with future bias, but keep the phrase if we can't parse
-    const { value: dateStr, normalized: dateNormalized, original: originalDatePhrase } =
-      normalizeDate(rawDate, callMoment);
+    // Parse inputs safely — never default to NOW when unclear
+    const dateObj = normalizeDate(rawDate, callMoment); // {value, source} | null
+    const dateStr = dateObj?.value || null;
+    const timeStr = parseLocalTimeToHHmm(rawTime, callMoment); // string | null
 
-    const timeStr = parseLocalTimeToHHmm(rawTime, callMoment);
+    if (!dateStr || !timeStr) {
+      return res.status(200).json({
+        isFree: false,
+        eventId: null,
+        message: !dateStr && !timeStr
+          ? "I couldn't understand the date and time. Please say a date like 'October 1' and a time like '3 pm'."
+          : !dateStr
+            ? "I couldn't understand the date. Please say a date like 'October 1' or '2025-10-01'."
+            : "I couldn't understand the time. Please say a time like '3 pm' or '15:00'.",
+        need: { date: !dateStr, time: !timeStr }
+      });
+    }
 
+    // Duration (minutes) default 30
     let duration = 30;
     if (rawDuration != null) {
       if (typeof rawDuration === "number") duration = rawDuration;
       else {
-        const n = parseInt(String(rawDuration).replace(/\\D/g, ""), 10);
+        const n = parseInt(String(rawDuration).replace(/\D/g, ""), 10);
         if (!isNaN(n)) duration = n;
       }
     }
 
-    const apptMoment = moment.tz(`${dateStr} ${timeStr}`, "YYYY-MM-DD HH:mm", TZ);
+    let apptMoment = moment.tz(`${dateStr} ${timeStr}`, "YYYY-MM-DD HH:mm", TZ);
+    if (!apptMoment.isValid()) {
+      return res.status(200).json({
+        isFree: false,
+        eventId: null,
+        message: "That didn't look like a valid date/time. Try '2025-10-01 at 3 pm'."
+      });
+    }
+
+    // If phrase-derived date/time ended up in the past, nudge forward one day (do NOT use call time)
+    if (apptMoment.isBefore(callMoment)) {
+      if (!(dateObj && dateObj.source === "iso")) {
+        apptMoment = apptMoment.add(1, "day");
+      }
+    }
+
     const startISO = apptMoment.toISOString();
     const endISO   = apptMoment.clone().add(duration, "minutes").toISOString();
 
@@ -213,7 +240,7 @@ app.post("/tools/check-availability", async (req, res) => {
         return res.json({
           isFree: false,
           eventId: null,
-          message: `Sorry, ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} is already booked.`
+          message: `Sorry, ${apptMoment.format("YYYY-MM-DD")} at ${apptMoment.format("h:mm a")} is already booked. Would you like a different time that day?`
         });
       }
     } catch (err) {
@@ -230,7 +257,7 @@ app.post("/tools/check-availability", async (req, res) => {
     try {
       const gcal = makeGcalClientOrThrow();
       const summary = `Appointment – ${String(customerName || "Customer")}`;
-      const description = `Booked by AI receptionist.\\nPhone: ${String(customerPhone || "")}\\nEmail: ${String(customerEmail || "")}`;
+      const description = `Booked by AI receptionist.\nPhone: ${String(customerPhone || "")}\nEmail: ${String(customerEmail || "")}`;
       const attendees = customerEmail ? [customerEmail] : [];
 
       const ev = await gcal.events.insert({
@@ -274,9 +301,7 @@ app.post("/tools/check-availability", async (req, res) => {
         iso: startISO,
         timeOfDay: timeOfDay(apptMoment.hour()),
         durationMinutes: duration,
-        timezone: TZ,
-        originalDatePhrase,
-        normalizedDate: dateNormalized
+        timezone: TZ
       }
     });
   } catch (err) {
