@@ -14,7 +14,6 @@ const TZ =
 
 const TOOL_SECRET = (process.env.TOOL_SECRET || "").trim();
 const CALENDAR_ID = (process.env.CALENDAR_ID || "primary").trim();
-const DEBUG_FB = (process.env.DEBUG_FB || "").toLowerCase() === "true";
 
 // ---------- Helpers ----------
 function timeOfDay(h) {
@@ -134,6 +133,37 @@ app.get("/debug/freebusy", async (_req, res) => {
   }
 });
 
+// 🔥 New probe route: confirms calendar access & lists events
+app.get("/debug/probe-schedule", async (_req, res) => {
+  try {
+    const gcal = makeGcalClientOrThrow();
+    const meta = await gcal.calendars.get({ calendarId: CALENDAR_ID });
+    const now = moment().tz(TZ).toISOString();
+    const events = await gcal.events.list({
+      calendarId: CALENDAR_ID,
+      timeMin: now,
+      singleEvents: true,
+      orderBy: "startTime",
+      maxResults: 10,
+    });
+
+    res.json({
+      ok: true,
+      calendarId: CALENDAR_ID,
+      calendarSummary: meta.data.summary,
+      tz: TZ,
+      upcoming: (events.data.items || []).map((e) => ({
+        id: e.id,
+        summary: e.summary,
+        start: e.start?.dateTime || e.start?.date,
+        end: e.end?.dateTime || e.end?.date,
+      })),
+    });
+  } catch (err) {
+    res.status(200).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
 // ---------- Main webhook ----------
 app.post("/tools/check-availability", async (req, res) => {
   try {
@@ -167,7 +197,7 @@ app.post("/tools/check-availability", async (req, res) => {
 
     let duration = 30;
     if (rawDuration) {
-      const n = parseInt(String(rawDuration).replace(/\\D/g, ""), 10);
+      const n = parseInt(String(rawDuration).replace(/\D/g, ""), 10);
       if (!isNaN(n)) duration = n;
     }
 
@@ -195,11 +225,17 @@ app.post("/tools/check-availability", async (req, res) => {
         items: [{ id: CALENDAR_ID }],
       },
     });
-    const busy = fb.data.calendars?.[CALENDAR_ID]?.busy || [];
+    const calendars = fb.data.calendars || {};
+    const keys = Object.keys(calendars);
+    const key = calendars[CALENDAR_ID] ? CALENDAR_ID : keys[0] || null;
+    const busy = key ? calendars[key].busy || [] : [];
+
     if (busy.length > 0) {
       return res.json({
         isFree: false,
-        message: "That time is already booked.",
+        message: `Sorry, ${apptMoment.format(
+          "YYYY-MM-DD"
+        )} at ${apptMoment.format("h:mm a")} is already booked.`,
       });
     }
 
